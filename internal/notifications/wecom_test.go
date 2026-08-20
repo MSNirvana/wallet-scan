@@ -22,11 +22,20 @@ func TestWeComClientSendsMarkdownWithoutCredentials(t *testing.T) {
 	}))
 	defer server.Close()
 	client := NewWeComClient(server.URL, time.Second)
-	err := client.SendPositive(context.Background(), db.NotificationView{Address: "0xabc", Label: "test", Findings: []db.PositiveView{{Chain: "ethereum", Balance: "1", AssetSymbol: "ETH"}}})
+	err := client.SendPositive(context.Background(), db.NotificationView{Address: "0xabc", Label: "test", Findings: []db.PositiveView{{Chain: "ethereum", Balance: "1000000000000000000", AssetSymbol: "ETH"}}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(body, "0xabc") || strings.Contains(body, "private") {
+	if !strings.Contains(body, "0xabc") || !strings.Contains(body, "1 ETH") || !strings.Contains(body, "1000000000000000000 wei") || strings.Contains(body, "private") {
 		t.Fatalf("unexpected body: %s", body)
+	}
+}
+
+func TestFormatAtomicTrimsFractionZeros(t *testing.T) {
+	if got := formatAtomic("150000000", 8); got != "1.5" {
+		t.Fatalf("got %s", got)
+	}
+	if got := formatAtomic("1", 18); got != "0.000000000000000001" {
+		t.Fatalf("got %s", got)
 	}
 }

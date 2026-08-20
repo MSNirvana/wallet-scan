@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
+	"strings"
 	"time"
 
 	"wallet-scan/internal/db"
@@ -34,11 +36,49 @@ func (c *WeComClient) SendPositive(ctx context.Context, view db.NotificationView
 	}
 	content += "\n\n余额："
 	for _, finding := range view.Findings {
-		content += "\n" + finding.Chain + "：" + finding.Balance + " " + finding.AssetSymbol
+		content += "\n" + formatFinding(finding)
 	}
 	content += "\n\n查询时间：" + time.Now().Format(time.RFC3339)
 	payload := map[string]any{"msgtype": "markdown", "markdown": map[string]string{"content": content}}
 	return c.send(ctx, payload)
+}
+
+func formatFinding(finding db.PositiveView) string {
+	decimals, atomicUnit := chainUnits(finding.Chain)
+	display := formatAtomic(finding.Balance, decimals)
+	return finding.Chain + "：" + display + " " + finding.AssetSymbol + "（最小单位：" + finding.Balance + " " + atomicUnit + "）"
+}
+
+func chainUnits(chain string) (int, string) {
+	switch chain {
+	case "btc":
+		return 8, "satoshi"
+	case "ethereum", "arbitrum", "bsc":
+		return 18, "wei"
+	case "solana":
+		return 9, "lamport"
+	case "tron":
+		return 6, "sun"
+	default:
+		return 0, "atomic"
+	}
+}
+
+func formatAtomic(raw string, decimals int) string {
+	value := new(big.Int)
+	if _, ok := value.SetString(raw, 10); !ok || decimals == 0 {
+		return raw
+	}
+	digits := value.String()
+	if len(digits) <= decimals {
+		digits = strings.Repeat("0", decimals+1-len(digits)) + digits
+	}
+	point := len(digits) - decimals
+	whole, fraction := digits[:point], strings.TrimRight(digits[point:], "0")
+	if fraction == "" {
+		return whole
+	}
+	return whole + "." + fraction
 }
 
 // SendNode sends one provider outage notification.
