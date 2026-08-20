@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"wallet-scan/internal/adaptive"
 	"wallet-scan/internal/config"
 	"wallet-scan/internal/db"
 	"wallet-scan/internal/httpserver"
@@ -73,7 +74,7 @@ func retryFailed(ctx context.Context, store *db.Store, cfg config.Config) error 
 	if cfg.WeComWebhookURL == "" {
 		return fmt.Errorf("WECOM_WEBHOOK_URL is required for retry-failed")
 	}
-	service, outbox := buildScanner(store, cfg)
+	service, outbox, _ := buildScanner(store, cfg)
 	service.Notifier = outbox
 	for {
 		before, err := store.ReadStatus(ctx)
@@ -144,49 +145,37 @@ func runScan(ctx context.Context, store *db.Store, cfg config.Config) error {
 	if cfg.WeComWebhookURL == "" {
 		return fmt.Errorf("WECOM_WEBHOOK_URL is required for scan")
 	}
-	service, outbox := buildScanner(store, cfg)
+	service, outbox, _ := buildScanner(store, cfg)
 	service.Notifier = outbox
 	return service.RunOnce(ctx)
 }
 
 func runService(ctx context.Context, store *db.Store, cfg config.Config) error {
-	if cfg.WeComWebhookURL == "" {
-		return fmt.Errorf("WECOM_WEBHOOK_URL is required for service mode")
+	providerSet := buildProviders(cfg)
+	apiLimiter := adaptive.New(adaptive.Config{
+		InitialConcurrency: cfg.APIInitialConcurrency,
+		MaxConcurrency:     cfg.APIMaxInFlight,
+		QueueWait:          cfg.APIQueueWait,
+		AdjustInterval:     cfg.APIAdjustInterval,
+		TargetLatency:      cfg.APITargetLatency,
+	})
+	for chain := range providerSet {
+		apiLimiter.Register(chain)
 	}
-	service, outbox := buildScanner(store, cfg)
-	service.Notifier = outbox
-	statusServer := &httpserver.Server{Store: store}
+	balanceService := &httpserver.BalanceService{
+		Providers:      providerSet,
+		Limiter:        apiLimiter,
+		APIKey:         cfg.APIKey,
+		RequestTimeout: cfg.RequestTimeout,
+	}
+	statusServer := &httpserver.Server{Store: store, Balance: balanceService}
 	serverErrors := make(chan error, 1)
 	go func() { serverErrors <- statusServer.ListenAndServe(ctx, cfg.BindAddress) }()
-	if err := service.RunOnce(ctx); err != nil {
-		log.Printf("scan stopped: %v", err)
-	}
-	cleanup := &maintenance.Cleaner{Store: store}
-	outboxTicker := time.NewTicker(30 * time.Second)
-	scanTicker := time.NewTicker(30 * time.Second)
-	cleanupTicker := time.NewTicker(24 * time.Hour)
-	defer outboxTicker.Stop()
-	defer scanTicker.Stop()
-	defer cleanupTicker.Stop()
-	for {
-		select {
-		case err := <-serverErrors:
-			return err
-		case <-outboxTicker.C:
-			if err := outbox.Drain(ctx, 100); err != nil {
-				log.Printf("notification retry: %v", err)
-			}
-		case <-scanTicker.C:
-			if err := service.RunOnce(ctx); err != nil {
-				log.Printf("scan retry: %v", err)
-			}
-		case <-cleanupTicker.C:
-			if err := runCleanupWith(cleanup, ctx, cfg); err != nil {
-				log.Printf("cleanup: %v", err)
-			}
-		case <-ctx.Done():
-			return nil
-		}
+	select {
+	case err := <-serverErrors:
+		return err
+	case <-ctx.Done():
+		return nil
 	}
 }
 
@@ -208,16 +197,8 @@ func runCleanupWith(cleaner *maintenance.Cleaner, ctx context.Context, cfg confi
 	}
 }
 
-func buildScanner(store *db.Store, cfg config.Config) (*scanner.Scanner, *notifications.Outbox) {
-	httpClient := providers.NewHTTPClient(cfg.RequestTimeout)
-	providerSet := map[string]providers.Provider{
-		"btc":      providers.NewBTCProvider(httpClient, cfg.Provider.BTCURL),
-		"ethereum": providers.NewEVMProvider(httpClient, cfg.Provider.ETHURL, "ethereum", "ETH"),
-		"arbitrum": providers.NewEVMProvider(httpClient, cfg.Provider.ARBURL, "arbitrum", "ETH"),
-		"bsc":      providers.NewEVMProvider(httpClient, cfg.Provider.BSCURL, "bsc", "BNB"),
-		"solana":   providers.NewSolanaProvider(httpClient, cfg.Provider.SOLURL),
-		"tron":     providers.NewTRONProvider(httpClient, cfg.Provider.TRONURL),
-	}
+func buildScanner(store *db.Store, cfg config.Config) (*scanner.Scanner, *notifications.Outbox, map[string]providers.Provider) {
+	providerSet := buildProviders(cfg)
 	limits := map[string]int{
 		"btc": cfg.Provider.BTCConcurrency, "ethereum": cfg.Provider.ETHConcurrency,
 		"arbitrum": cfg.Provider.ARBConcurrency, "bsc": cfg.Provider.BSCConcurrency,
@@ -228,5 +209,17 @@ func buildScanner(store *db.Store, cfg config.Config) (*scanner.Scanner, *notifi
 		RetryBaseDelay: cfg.RetryBaseDelay, NodeFailureThreshold: cfg.NodeFailureThreshold,
 	}, limits)
 	outbox := &notifications.Outbox{Store: store, Client: notifications.NewWeComClient(cfg.WeComWebhookURL, cfg.RequestTimeout)}
-	return service, outbox
+	return service, outbox, providerSet
+}
+
+func buildProviders(cfg config.Config) map[string]providers.Provider {
+	httpClient := providers.NewHTTPClient(cfg.RequestTimeout)
+	return map[string]providers.Provider{
+		"btc":      providers.NewBTCProvider(httpClient, cfg.Provider.BTCURL),
+		"ethereum": providers.NewEVMProvider(httpClient, cfg.Provider.ETHURL, "ethereum", "ETH"),
+		"arbitrum": providers.NewEVMProvider(httpClient, cfg.Provider.ARBURL, "arbitrum", "ETH"),
+		"bsc":      providers.NewEVMProvider(httpClient, cfg.Provider.BSCURL, "bsc", "BNB"),
+		"solana":   providers.NewSolanaProvider(httpClient, cfg.Provider.SOLURL),
+		"tron":     providers.NewTRONProvider(httpClient, cfg.Provider.TRONURL),
+	}
 }

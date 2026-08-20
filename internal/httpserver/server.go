@@ -9,9 +9,10 @@ import (
 	"wallet-scan/internal/db"
 )
 
-// Server exposes internal health and status endpoints only.
+// Server exposes internal health, status, capacity, and balance endpoints.
 type Server struct {
-	Store *db.Store
+	Store   *db.Store
+	Balance *BalanceService
 }
 
 // Handler builds the internal HTTP handler.
@@ -34,6 +35,10 @@ func (s *Server) Handler() http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(status)
 	})
+	if s.Balance != nil {
+		mux.HandleFunc("/v1/capacity", s.Balance.HandleCapacity)
+		mux.HandleFunc("/v1/balance", s.Balance.HandleBalance)
+	}
 	return mux
 }
 

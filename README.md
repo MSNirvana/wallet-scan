@@ -23,7 +23,47 @@ The service does not accept seed phrases or private keys and does not sign or su
 docker compose up -d --build
 ```
 
-The service runs migrations, resumes an unfinished scan, or creates one scan for the current address range. It does not restart completed scans automatically.
+The default service runs migrations and exposes the internal API. It does not automatically scan `wallet_addresses`; the legacy database scanner remains available through the explicit `scan` command below.
+
+## Synchronous balance API
+
+The service exposes a synchronous API for callers that already own the public-address list. This mode does not insert the submitted address into `wallet_addresses`; the caller owns result storage.
+
+Set `SCANNER_API_KEY` when the service is reachable from any private-network peer. The default Compose binding is `127.0.0.1`, so an empty key is acceptable only for local testing.
+
+Check the current dynamic recommendation:
+
+```bash
+curl -H "X-Internal-API-Key: your-key" \
+  http://127.0.0.1:8080/v1/capacity
+```
+
+Query one native balance:
+
+```bash
+curl -sS -X POST \
+  -H "Content-Type: application/json" \
+  -H "X-Internal-API-Key: your-key" \
+  -d '{"address_type":"evm","chain":"ethereum","address":"0x0000000000000000000000000000000000000001"}' \
+  http://127.0.0.1:8080/v1/balance
+```
+
+A successful response has `state: "checked"`. `balance_atomic` is an exact integer in the chain's smallest unit and `has_balance` tells the caller whether it is positive. A zero result can be discarded by the caller; a positive result should be persisted by the caller.
+
+The caller must retry `429`, `503`, timeouts, and other `state: "retry"` responses. `400` responses with `invalid_address` or `invalid_chain` are rejected inputs. A `429` response includes `Retry-After` and `retry_after_ms`.
+
+Concurrency starts at `API_INITIAL_CONCURRENCY` (default `20`) and adapts from latency and retryable errors up to `API_MAX_IN_FLIGHT` (default `100`). `/v1/capacity` is a recommendation, not a guarantee; the server still enforces the hard limit. Use one caller-side semaphore per process and lower concurrency after rate limits.
+
+Relevant API settings:
+
+```env
+SCANNER_API_KEY=
+API_MAX_IN_FLIGHT=100
+API_INITIAL_CONCURRENCY=20
+API_QUEUE_WAIT_MS=250
+API_ADJUST_INTERVAL_SECONDS=5
+API_TARGET_LATENCY_MS=800
+```
 
 ## Import addresses
 
@@ -39,10 +79,13 @@ Mount the input file into the scanner container or copy it into a mounted data d
 
 ```bash
 docker compose exec scanner wallet-scan status
+docker compose exec scanner wallet-scan scan
 docker compose exec scanner wallet-scan retry-failed
 docker compose exec scanner wallet-scan export-hits
 docker compose exec scanner wallet-scan cleanup
 ```
+
+`scan`, `retry-failed`, `export-hits`, and `cleanup` are legacy database-mode operations. Do not run `scan` at the same time as a caller-driven API load unless you intentionally want both workloads to share the configured provider endpoints.
 
 `/healthz` and `/status` are internal endpoints. A provider timeout, rate limit, or RPC error is never treated as a zero balance. Failed addresses remain in `retry_queue`; successful zero-balance addresses become eligible for deletion seven days after their completed scan. Positive findings are retained.
 

@@ -10,18 +10,24 @@ import (
 
 // Config contains runtime configuration for the scanner service.
 type Config struct {
-	DatabaseURL          string
-	BindAddress          string
-	WeComWebhookURL      string
-	ScanMode             string
-	BatchSize            int
-	MaxRetries           int
-	EmptyRetentionDays   int
-	RequestTimeout       time.Duration
-	AddressWorkers       int
-	NodeFailureThreshold int
-	RetryBaseDelay       time.Duration
-	Provider             ProviderConfig
+	DatabaseURL           string
+	BindAddress           string
+	APIKey                string
+	APIMaxInFlight        int
+	APIInitialConcurrency int
+	APIQueueWait          time.Duration
+	APIAdjustInterval     time.Duration
+	APITargetLatency      time.Duration
+	WeComWebhookURL       string
+	ScanMode              string
+	BatchSize             int
+	MaxRetries            int
+	EmptyRetentionDays    int
+	RequestTimeout        time.Duration
+	AddressWorkers        int
+	NodeFailureThreshold  int
+	RetryBaseDelay        time.Duration
+	Provider              ProviderConfig
 }
 
 // ProviderConfig contains endpoint and per-chain concurrency settings.
@@ -43,17 +49,23 @@ type ProviderConfig struct {
 // Load reads environment variables and validates required values.
 func Load() (Config, error) {
 	c := Config{
-		DatabaseURL:          os.Getenv("DATABASE_URL"),
-		BindAddress:          envString("BIND_ADDRESS", "0.0.0.0:8080"),
-		WeComWebhookURL:      os.Getenv("WECOM_WEBHOOK_URL"),
-		ScanMode:             envString("SCAN_MODE", "once"),
-		BatchSize:            envInt("BATCH_SIZE", 100),
-		MaxRetries:           envInt("MAX_RETRIES", 3),
-		EmptyRetentionDays:   envInt("EMPTY_RETENTION_DAYS", 7),
-		RequestTimeout:       time.Duration(envInt("REQUEST_TIMEOUT_SECONDS", 12)) * time.Second,
-		AddressWorkers:       envInt("ADDRESS_WORKERS", 8),
-		NodeFailureThreshold: envInt("NODE_FAILURE_THRESHOLD", 5),
-		RetryBaseDelay:       time.Duration(envInt("RETRY_BASE_DELAY_SECONDS", 2)) * time.Second,
+		DatabaseURL:           os.Getenv("DATABASE_URL"),
+		BindAddress:           envString("BIND_ADDRESS", "0.0.0.0:8080"),
+		APIKey:                os.Getenv("SCANNER_API_KEY"),
+		APIMaxInFlight:        envInt("API_MAX_IN_FLIGHT", 100),
+		APIInitialConcurrency: envInt("API_INITIAL_CONCURRENCY", 20),
+		APIQueueWait:          time.Duration(envInt("API_QUEUE_WAIT_MS", 250)) * time.Millisecond,
+		APIAdjustInterval:     time.Duration(envInt("API_ADJUST_INTERVAL_SECONDS", 5)) * time.Second,
+		APITargetLatency:      time.Duration(envInt("API_TARGET_LATENCY_MS", 800)) * time.Millisecond,
+		WeComWebhookURL:       os.Getenv("WECOM_WEBHOOK_URL"),
+		ScanMode:              envString("SCAN_MODE", "once"),
+		BatchSize:             envInt("BATCH_SIZE", 100),
+		MaxRetries:            envInt("MAX_RETRIES", 3),
+		EmptyRetentionDays:    envInt("EMPTY_RETENTION_DAYS", 7),
+		RequestTimeout:        time.Duration(envInt("REQUEST_TIMEOUT_SECONDS", 12)) * time.Second,
+		AddressWorkers:        envInt("ADDRESS_WORKERS", 8),
+		NodeFailureThreshold:  envInt("NODE_FAILURE_THRESHOLD", 5),
+		RetryBaseDelay:        time.Duration(envInt("RETRY_BASE_DELAY_SECONDS", 2)) * time.Second,
 		Provider: ProviderConfig{
 			BTCURL:          envString("BTC_API_URL", "https://mempool.space/api"),
 			ETHURL:          envString("ETH_RPC_URL", "https://ethereum-rpc.publicnode.com"),
@@ -74,6 +86,21 @@ func Load() (Config, error) {
 	}
 	if c.ScanMode != "once" {
 		return Config{}, fmt.Errorf("SCAN_MODE must be once, got %q", c.ScanMode)
+	}
+	if c.APIMaxInFlight < 1 || c.APIMaxInFlight > 10000 {
+		return Config{}, fmt.Errorf("API_MAX_IN_FLIGHT must be between 1 and 10000")
+	}
+	if c.APIInitialConcurrency < 1 || c.APIInitialConcurrency > c.APIMaxInFlight {
+		return Config{}, fmt.Errorf("API_INITIAL_CONCURRENCY must be between 1 and API_MAX_IN_FLIGHT")
+	}
+	if c.APIQueueWait <= 0 {
+		return Config{}, fmt.Errorf("API_QUEUE_WAIT_MS must be positive")
+	}
+	if c.APIAdjustInterval <= 0 {
+		return Config{}, fmt.Errorf("API_ADJUST_INTERVAL_SECONDS must be positive")
+	}
+	if c.APITargetLatency <= 0 {
+		return Config{}, fmt.Errorf("API_TARGET_LATENCY_MS must be positive")
 	}
 	if c.BatchSize <= 0 || c.BatchSize > 10000 {
 		return Config{}, fmt.Errorf("BATCH_SIZE must be between 1 and 10000")
