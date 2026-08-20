@@ -1,0 +1,5 @@
+address_type,address,label
+evm,0x0000000000000000000000000000000000000001,example-evm
+btc,bc1qexampleaddress000000000000000000000000,example-btc
+sol,11111111111111111111111111111111,example-sol
+trx,TQF5mJ7vW8gGv7xXzJx7S5m8Pj8X4B2D7A,example-trx
