@@ -38,6 +38,25 @@ CREATE TABLE IF NOT EXISTS positive_findings (
     UNIQUE (address_id, chain)
 );
 
+CREATE TABLE IF NOT EXISTS wallet_balance_checks (
+    id BIGSERIAL PRIMARY KEY,
+    address_id BIGINT NOT NULL REFERENCES wallet_addresses(id) ON DELETE CASCADE,
+    chain TEXT NOT NULL CHECK (chain IN ('btc', 'ethereum', 'arbitrum', 'bsc', 'solana', 'tron')),
+    state TEXT NOT NULL CHECK (state IN ('checked', 'retry')),
+    balance_atomic NUMERIC(78, 0) CHECK (balance_atomic >= 0),
+    asset_symbol TEXT,
+    error_code TEXT,
+    error_message TEXT,
+    provider TEXT,
+    retry_after_ms BIGINT,
+    checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (
+        (state = 'checked' AND balance_atomic IS NOT NULL AND asset_symbol IS NOT NULL)
+        OR (state = 'retry' AND balance_atomic IS NULL)
+    ),
+    UNIQUE (address_id, chain)
+);
+
 CREATE TABLE IF NOT EXISTS retry_queue (
     id BIGSERIAL PRIMARY KEY,
     address_id BIGINT NOT NULL REFERENCES wallet_addresses(id) ON DELETE CASCADE,
@@ -81,6 +100,7 @@ ALTER TABLE notification_events ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTA
 CREATE INDEX IF NOT EXISTS idx_wallet_addresses_id ON wallet_addresses(id);
 CREATE INDEX IF NOT EXISTS idx_scan_runs_status ON scan_runs(status);
 CREATE INDEX IF NOT EXISTS idx_positive_findings_address ON positive_findings(address_id);
+CREATE INDEX IF NOT EXISTS idx_wallet_balance_checks_address ON wallet_balance_checks(address_id);
 CREATE INDEX IF NOT EXISTS idx_retry_queue_next_retry ON retry_queue(next_retry_at);
 CREATE INDEX IF NOT EXISTS idx_retry_queue_address ON retry_queue(address_id);
 CREATE INDEX IF NOT EXISTS idx_notification_events_pending ON notification_events(status, created_at);
