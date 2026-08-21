@@ -64,30 +64,55 @@ func (s *Store) Migrate(ctx context.Context) error {
 
 // InsertAddresses inserts a batch and returns the number of new rows.
 func (s *Store) InsertAddresses(ctx context.Context, batchID uuid.UUID, addresses []domain.AddressInput) (int, error) {
+	_, inserted, err := s.insertAddressesWithIDs(ctx, batchID, addresses)
+	return inserted, err
+}
+
+// InsertAddressesWithIDs inserts a batch and returns the corresponding row IDs.
+func (s *Store) InsertAddressesWithIDs(ctx context.Context, batchID uuid.UUID, addresses []domain.AddressInput) ([]int64, error) {
+	ids, _, err := s.insertAddressesWithIDs(ctx, batchID, addresses)
+	return ids, err
+}
+
+func (s *Store) insertAddressesWithIDs(ctx context.Context, batchID uuid.UUID, addresses []domain.AddressInput) ([]int64, int, error) {
 	if len(addresses) == 0 {
-		return 0, nil
+		return []int64{}, 0, nil
 	}
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("begin address import: %w", err)
+		return nil, 0, fmt.Errorf("begin address import: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	ids := make([]int64, 0, len(addresses))
 	inserted := 0
 	for _, address := range addresses {
-		result, err := tx.Exec(ctx, `
+		var id int64
+		err := tx.QueryRow(ctx, `
 			INSERT INTO wallet_addresses (address_type, address, normalized_address, label, import_batch_id)
 			VALUES ($1, $2, $3, $4, $5)
-			ON CONFLICT (address_type, normalized_address) DO NOTHING`,
-			address.AddressType, address.Address, address.Normalized, address.Label, batchID)
-		if err != nil {
-			return 0, fmt.Errorf("insert address: %w", err)
+			ON CONFLICT (address_type, normalized_address) DO NOTHING
+			RETURNING id`,
+			address.AddressType, address.Address, address.Normalized, address.Label, batchID).Scan(&id)
+		wasInserted := true
+		if errors.Is(err, pgx.ErrNoRows) {
+			wasInserted = false
+			err = tx.QueryRow(ctx, `
+				SELECT id FROM wallet_addresses
+				WHERE address_type = $1 AND normalized_address = $2`,
+				address.AddressType, address.Normalized).Scan(&id)
 		}
-		inserted += int(result.RowsAffected())
+		if err != nil {
+			return nil, 0, fmt.Errorf("insert address: %w", err)
+		}
+		ids = append(ids, id)
+		if wasInserted {
+			inserted++
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("commit address import: %w", err)
+		return nil, 0, fmt.Errorf("commit address import: %w", err)
 	}
-	return inserted, nil
+	return ids, inserted, nil
 }
 
 // AddressRange returns the current source range, or false when empty.
@@ -210,6 +235,20 @@ type PositiveFinding struct {
 	AssetSymbol string
 }
 
+// WalletBalanceCheck is one persisted result from a startup-generated address query.
+type WalletBalanceCheck struct {
+	AddressID     int64
+	Chain         string
+	State         string
+	BalanceAtomic string
+	AssetSymbol   string
+	ErrorCode     string
+	ErrorMessage  string
+	Provider      string
+	RetryAfterMS  *int64
+	CheckedAt     time.Time
+}
+
 // PositiveView is a positive balance joined with its public address.
 type PositiveView struct {
 	Chain       string
@@ -313,6 +352,32 @@ func (s *Store) SavePositiveFindings(ctx context.Context, findings []PositiveFin
 		return nil, fmt.Errorf("commit positive findings: %w", err)
 	}
 	return &eventID, nil
+}
+
+// SaveWalletBalanceCheck stores one complete startup query result.
+func (s *Store) SaveWalletBalanceCheck(ctx context.Context, check WalletBalanceCheck) error {
+	if check.CheckedAt.IsZero() {
+		check.CheckedAt = time.Now().UTC()
+	}
+	var balance any
+	if check.BalanceAtomic != "" {
+		balance = check.BalanceAtomic
+	}
+	var retryAfter any
+	if check.RetryAfterMS != nil {
+		retryAfter = *check.RetryAfterMS
+	}
+	_, err := s.Pool.Exec(ctx, `
+		INSERT INTO wallet_balance_checks
+			(address_id, chain, state, balance_atomic, asset_symbol, error_code, error_message, provider, retry_after_ms, checked_at)
+		VALUES ($1, $2, $3, $4::numeric, NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), NULLIF($8, ''), $9::bigint, $10)
+		ON CONFLICT (address_id, chain) DO UPDATE SET
+			state = EXCLUDED.state, balance_atomic = EXCLUDED.balance_atomic, asset_symbol = EXCLUDED.asset_symbol,
+			error_code = EXCLUDED.error_code, error_message = EXCLUDED.error_message, provider = EXCLUDED.provider,
+			retry_after_ms = EXCLUDED.retry_after_ms, checked_at = EXCLUDED.checked_at`,
+		check.AddressID, check.Chain, check.State, balance, check.AssetSymbol, check.ErrorCode,
+		check.ErrorMessage, check.Provider, retryAfter, check.CheckedAt)
+	return err
 }
 
 // CreateNotificationEvent adds a durable outbox event.

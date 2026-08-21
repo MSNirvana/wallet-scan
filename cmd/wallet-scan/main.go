@@ -5,15 +5,19 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 
 	"wallet-scan/internal/adaptive"
+	"wallet-scan/internal/balanceclient"
 	"wallet-scan/internal/config"
 	"wallet-scan/internal/db"
 	"wallet-scan/internal/httpserver"
@@ -22,6 +26,8 @@ import (
 	"wallet-scan/internal/notifications"
 	"wallet-scan/internal/providers"
 	"wallet-scan/internal/scanner"
+	"wallet-scan/internal/startupcheck"
+	"wallet-scan/internal/wallet"
 )
 
 func main() {
@@ -31,6 +37,13 @@ func main() {
 }
 
 func run(args []string) error {
+	return runWithIO(args, os.Stdout, os.Stderr)
+}
+
+func runWithIO(args []string, stdout, stderr io.Writer) error {
+	if len(args) > 0 && args[0] == "generate" {
+		return generateCommand(args[1:], stdout, stderr)
+	}
 	configValue, err := config.Load()
 	if err != nil {
 		return err
@@ -66,8 +79,168 @@ func run(args []string) error {
 	case "run":
 		return runService(ctx, store, configValue)
 	default:
-		return fmt.Errorf("unknown command %q; use run, import, scan, status, retry-failed, export-hits, or cleanup", command)
+		return fmt.Errorf("unknown command %q; use generate, run, import, scan, status, retry-failed, export-hits, or cleanup", command)
 	}
+}
+
+func generateCommand(args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("generate", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	words := flags.Int("words", 12, "mnemonic word count: 12 or 24")
+	jsonOutput := flags.Bool("json", false, "write machine-readable JSON")
+	scan := flags.Bool("scan", false, "query generated addresses through wallet-scan")
+	apiURL := flags.String("api-url", "http://127.0.0.1:8080", "wallet-scan API base URL")
+	apiKey := flags.String("api-key", os.Getenv("SCANNER_API_KEY"), "wallet-scan API key; prefer SCANNER_API_KEY")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("generate does not accept positional arguments")
+	}
+	var client *balanceclient.Client
+	if *scan {
+		var err error
+		client, err = balanceclient.New(*apiURL, *apiKey, nil)
+		if err != nil {
+			return err
+		}
+	}
+	result, err := wallet.Generate(*words)
+	if err != nil {
+		return err
+	}
+	var scanResults []balanceclient.Result
+	var scanErr error
+	if client != nil {
+		scanResults, scanErr = scanGeneratedWallet(context.Background(), client, result)
+	}
+	if *jsonOutput {
+		if client == nil {
+			encoder := json.NewEncoder(stdout)
+			encoder.SetIndent("", "  ")
+			return encoder.Encode(result)
+		}
+		if err := writeJSON(stdout, generatedOutput{Mnemonic: result.Mnemonic, Addresses: result.Addresses, Scan: scanResults}); err != nil {
+			return err
+		}
+		return scanErr
+	}
+	if err := writeHumanResult(stdout, result); err != nil {
+		return err
+	}
+	if client == nil {
+		return nil
+	}
+	if err := writeScanText(stdout, scanResults); err != nil {
+		return err
+	}
+	return scanErr
+}
+
+type generatedOutput struct {
+	Mnemonic  string                 `json:"mnemonic"`
+	Addresses wallet.Addresses       `json:"addresses"`
+	Scan      []balanceclient.Result `json:"scan"`
+}
+
+func writeJSON(stdout io.Writer, output generatedOutput) error {
+	encoder := json.NewEncoder(stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(output)
+}
+
+func scanGeneratedWallet(ctx context.Context, client *balanceclient.Client, result wallet.Result) ([]balanceclient.Result, error) {
+	queries := []balanceclient.Query{
+		{AddressType: "btc", Chain: "btc", Address: result.Addresses.BTC.Address},
+		{AddressType: "evm", Chain: "ethereum", Address: result.Addresses.ETH.Address},
+		{AddressType: "evm", Chain: "arbitrum", Address: result.Addresses.ETH.Address},
+		{AddressType: "evm", Chain: "bsc", Address: result.Addresses.ETH.Address},
+		{AddressType: "sol", Chain: "solana", Address: result.Addresses.SOL.Address},
+		{AddressType: "trx", Chain: "tron", Address: result.Addresses.TRX.Address},
+	}
+	results := make([]balanceclient.Result, len(queries))
+	errorsByIndex := make([]error, len(queries))
+	var waitGroup sync.WaitGroup
+	waitGroup.Add(len(queries))
+	for index, query := range queries {
+		go func(index int, query balanceclient.Query) {
+			defer waitGroup.Done()
+			results[index], errorsByIndex[index] = client.Check(ctx, query)
+		}(index, query)
+	}
+	waitGroup.Wait()
+
+	failed := make([]string, 0)
+	for index, result := range results {
+		if errorsByIndex[index] != nil || result.State != "checked" {
+			state := result.State
+			if state == "" {
+				state = "client_error"
+			}
+			failed = append(failed, result.Chain+":"+state)
+		}
+	}
+	if len(failed) > 0 {
+		return results, fmt.Errorf("balance scan failed for %d/%d queries: %s", len(failed), len(results), strings.Join(failed, ", "))
+	}
+	return results, nil
+}
+
+func writeScanText(stdout io.Writer, results []balanceclient.Result) error {
+	if _, err := fmt.Fprintln(stdout, "\nBalance checks:"); err != nil {
+		return err
+	}
+	for _, result := range results {
+		if result.State != "checked" {
+			if _, err := fmt.Fprintf(stdout, "%-8s %-9s %s: %s\n", result.AddressType, result.Chain, result.State, result.ErrorCode); err != nil {
+				return err
+			}
+			continue
+		}
+		status := "zero"
+		if result.HasBalance {
+			status = "positive"
+		}
+		if _, err := fmt.Fprintf(stdout, "%-8s %-9s %s %s (%s, %s)\n", result.AddressType, result.Chain, result.BalanceAtomic, atomicUnit(result.Chain), result.AssetSymbol, status); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func atomicUnit(chain string) string {
+	switch chain {
+	case "btc":
+		return "satoshi"
+	case "ethereum", "arbitrum", "bsc":
+		return "wei"
+	case "solana":
+		return "lamport"
+	case "tron":
+		return "sun"
+	default:
+		return "atomic units"
+	}
+}
+
+func writeHumanResult(stdout io.Writer, result wallet.Result) error {
+	if _, err := fmt.Fprintf(stdout, "Mnemonic: %s\n\n", result.Mnemonic); err != nil {
+		return err
+	}
+	for _, item := range []struct {
+		name    string
+		address wallet.Address
+	}{
+		{name: "BTC", address: result.Addresses.BTC},
+		{name: "ETH", address: result.Addresses.ETH},
+		{name: "SOL", address: result.Addresses.SOL},
+		{name: "TRX", address: result.Addresses.TRX},
+	} {
+		if _, err := fmt.Fprintf(stdout, "%-3s %-19s %s\n", item.name, item.address.Path, item.address.Address); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func retryFailed(ctx context.Context, store *db.Store, cfg config.Config) error {
@@ -161,6 +334,12 @@ func runService(ctx context.Context, store *db.Store, cfg config.Config) error {
 	})
 	for chain := range providerSet {
 		apiLimiter.Register(chain)
+	}
+	if cfg.GenerateWalletOnStartup {
+		startup := startupcheck.New(store, providerSet, apiLimiter)
+		if err := startup.RunOnce(ctx); err != nil {
+			log.Printf("startup wallet check failed: %v", err)
+		}
 	}
 	balanceService := &httpserver.BalanceService{
 		Providers:      providerSet,

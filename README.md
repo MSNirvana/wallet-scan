@@ -1,8 +1,45 @@
 # wallet-scan
 
-`wallet-scan` is an internal, read-only native-balance scanner for public wallet addresses. It accepts CSV address imports, scans each imported address once, stores positive native balances in PostgreSQL, and sends positive findings to an Enterprise WeChat group bot.
+`wallet-scan` is an internal, read-only native-balance scanner for public wallet addresses. The service can perform one startup wallet generation and balance check, while the separate `generate` command remains available for offline use. The scanner accepts CSV address imports, scans each imported address once, stores positive native balances in PostgreSQL, and sends positive findings to an Enterprise WeChat group bot.
 
-The service does not accept seed phrases or private keys and does not sign or submit transactions. The first version does not discover ERC-20, TRC-20, SPL tokens, or NFTs.
+The scanner service does not accept seed phrases or private keys and does not sign or submit transactions. The startup check and `generate` command create a new mnemonic locally; the startup check clears it before persistence and never logs or sends it. The first version does not discover ERC-20, TRC-20, SPL tokens, or NFTs.
+
+## Generate a wallet offline
+
+Generate one 12-word English BIP-39 mnemonic and the first mainnet address for each supported chain:
+
+```bash
+wallet-scan generate
+wallet-scan generate --words 24
+wallet-scan generate --json
+```
+
+Without `--scan`, this command runs before configuration and database startup. It does not require `DATABASE_URL`, PostgreSQL, RPC endpoints, or network access. It uses the operating system secure random source, keeps the result in process memory, and prints only the mnemonic and public addresses. It does not print private keys, extended private keys, or xpubs. The BIP-39 passphrase is empty and cannot be supplied as a command-line argument.
+
+The derivation paths are fixed to the first mainnet address:
+
+| Chain | Address format | Derivation path |
+| --- | --- | --- |
+| BTC | Native SegWit `bc1q...` | `m/84'/0'/0'/0/0` |
+| ETH | EIP-55 `0x...` | `m/44'/60'/0'/0/0` |
+| Solana | Base58 | `m/44'/501'/0'/0'` |
+| TRX | Base58Check `T...` | `m/44'/195'/0'/0/0` |
+
+Solana wallets have historical path variations. This generator uses the path shown above and displays it in the output so the same path can be selected when restoring the wallet.
+
+To query the generated public addresses through the existing synchronous balance API, opt in explicitly:
+
+```bash
+wallet-scan generate --scan \
+  --api-url http://127.0.0.1:8080 \
+  --api-key your-key
+```
+
+`--api-url` defaults to `http://127.0.0.1:8080`. `--api-key` defaults to `SCANNER_API_KEY`; using the environment variable avoids putting the key in shell history or the process list. The command sends six read-only requests: `btc/btc`, `evm/ethereum`, `evm/arbitrum`, `evm/bsc`, `sol/solana`, and `trx/tron`. It sends only public addresses and the API key header, never the mnemonic or private keys.
+
+Scan output reports each API `state`, exact `balance_atomic` value, asset symbol, and `has_balance`. HTTP 429, 503, timeout, connection, or malformed-response results are shown per chain and make the command exit nonzero; a successful generation and any successful chain results are still retained in the output.
+
+Treat the printed mnemonic as the wallet. Terminal scrollback, shell redirection, screen recording, logs, and clipboard history can retain it. Never paste it into chat, issue trackers, shell commands, or untrusted websites. For real funds, prefer a hardware wallet or audited wallet software and verify a receiving address with a small amount before use.
 
 ## Supported address types
 
@@ -23,7 +60,9 @@ The service does not accept seed phrases or private keys and does not sign or su
 docker compose up -d --build
 ```
 
-The default service runs migrations and exposes the internal API. It does not automatically scan `wallet_addresses`; the legacy database scanner remains available through the explicit `scan` command below.
+The default service runs migrations, generates one wallet, queries its six native-balance targets once, records the four public addresses and all six results, and exposes the internal API. It does not automatically run the legacy full-address scan. Set `GENERATE_WALLET_ON_STARTUP=false` to disable the startup task.
+
+The startup task never stores the mnemonic, writes `positive_findings`, or sends balance notifications. A provider failure is recorded as a failed result and is never converted to zero balance. The task does not loop or automatically retry.
 
 ## Synchronous balance API
 
@@ -84,6 +123,8 @@ docker compose exec scanner wallet-scan retry-failed
 docker compose exec scanner wallet-scan export-hits
 docker compose exec scanner wallet-scan cleanup
 ```
+
+The startup wallet check runs once per `wallet-scan run` process start by default. It records results in `wallet_balance_checks`; this table is separate from `positive_findings` and does not affect the legacy scan counters.
 
 `scan`, `retry-failed`, `export-hits`, and `cleanup` are legacy database-mode operations. Do not run `scan` at the same time as a caller-driven API load unless you intentionally want both workloads to share the configured provider endpoints.
 
